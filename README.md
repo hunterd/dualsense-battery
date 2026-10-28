@@ -10,7 +10,10 @@ notification.
 
 - Icône en forme de manette avec le pourcentage, colorée selon le niveau :
   vert (> 50 %), orange (21 à 50 %), rouge (≤ 20 %), bleu en charge, gris sans manette.
-- Infobulle et clic gauche : modèle, type de connexion et état de charge.
+- Jusqu'à 4 manettes à la fois : une icône par manette, numérotée de 1 à 4 dans
+  l'ordre de connexion. Le numéro est aussi envoyé aux voyants joueur de la manette,
+  comme sur PS5.
+- Infobulle et clic gauche : numéro, modèle, type de connexion et état de charge.
 - Notification à la connexion de la manette et quand la batterie passe sous 20 %.
 - Barre lumineuse de la manette (de chaque côté du pavé tactile) à la couleur de la
   batterie, réglée à la connexion puis à chaque changement de tranche.

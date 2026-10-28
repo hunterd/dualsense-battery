@@ -33,6 +33,7 @@ namespace DualSenseBattery
         public byte RawStatus;
         public uint SensorTimestamp;
         public string LightResult;
+        public int Slot;            // numéro de manette 1..MaxSlots, stable tant qu'elle reste connectée
 
         public string Name { get { return Edge ? "DualSense Edge" : "DualSense"; } }
         public string Link { get { return Connection == Connection.Usb ? "USB" : "Bluetooth"; } }
@@ -50,7 +51,12 @@ namespace DualSenseBattery
             }
         }
 
-        public string Describe() { return Name + " (" + Link + ") : " + Status; }
+        public string Label { get { return Slot > 0 ? "Manette " + Slot : Name; } }
+
+        public string Describe()
+        {
+            return (Slot > 0 ? "Manette " + Slot + " – " : "") + Name + " (" + Link + ") : " + Status;
+        }
     }
 
     static class Native
@@ -153,9 +159,14 @@ namespace DualSenseBattery
         // connexion ou quand la tranche de batterie change, pour laisser la main aux jeux.
         static readonly Dictionary<string, Color> sentLight = new Dictionary<string, Color>();
 
+        // Numéro attribué à chaque manette connectée (comme les joueurs 1 à 4 sur PS5)
+        public const int MaxSlots = 4;
+        static readonly Dictionary<string, int> slots = new Dictionary<string, int>();
+        static readonly byte[] PlayerLedPatterns = { 0x04, 0x0A, 0x15, 0x1B };   // voyants des joueurs 1 à 4
+
         public static List<ControllerState> Scan(bool driveLightbar)
         {
-            var result = new List<ControllerState>();
+            var found = new List<ControllerState>();
             foreach (string path in Native.EnumerateHidPaths())
             {
                 var attr = new Native.HIDD_ATTRIBUTES();
@@ -169,13 +180,28 @@ namespace DualSenseBattery
                 var st = new ControllerState { Path = path, Edge = attr.ProductID == DualSenseEdgePid };
                 st.Connection = path.IndexOf(BluetoothHidGuid, StringComparison.OrdinalIgnoreCase) >= 0
                     ? Connection.Bluetooth : Connection.Usb;
+                found.Add(st);
+            }
+
+            // Libère les numéros et l'état lumineux des manettes déconnectées avant d'en attribuer
+            foreach (string gone in slots.Keys.Where(p => !found.Any(s => s.Path == p)).ToList())
+                slots.Remove(gone);
+            foreach (string gone in sentLight.Keys.Where(p => !found.Any(s => s.Path == p)).ToList())
+                sentLight.Remove(gone);
+
+            foreach (var st in found)
+            {
+                int slot;
+                if (!slots.TryGetValue(st.Path, out slot))
+                {
+                    slot = Enumerable.Range(1, MaxSlots).FirstOrDefault(n => !slots.ContainsValue(n));
+                    if (slot > 0) slots[st.Path] = slot;
+                }
+                st.Slot = slot;
                 try { ReadBattery(st, driveLightbar); }
                 catch (Exception ex) { st.Error = "lecture impossible (" + ex.GetType().Name + ")"; }
-                result.Add(st);
             }
-            foreach (string gone in sentLight.Keys.Where(p => !result.Any(s => s.Path == p)).ToList())
-                sentLight.Remove(gone);
-            return result;
+            return found.OrderBy(s => s.Slot == 0 ? int.MaxValue : s.Slot).ToList();
         }
 
         static void ReadBattery(ControllerState st, bool driveLightbar)
@@ -255,7 +281,7 @@ namespace DualSenseBattery
                 WriteOutput(fs, st.Connection, outputLength, delegate(byte[] r, int o)
                 {
                     r[o + 1] = 0x04 | 0x10; // valid_flag1 : couleur de la barre lumineuse + voyants joueur
-                    r[o + 43] = 0x04;       // voyant joueur central allumé (joueur 1), il cesse de clignoter
+                    r[o + 43] = st.Slot > 0 ? PlayerLedPatterns[st.Slot - 1] : (byte)0;   // numéro de manette
                     r[o + 44] = c.R;
                     r[o + 45] = c.G;
                     r[o + 46] = c.B;
@@ -333,14 +359,22 @@ namespace DualSenseBattery
         const string RunValue = "DualSenseBattery";
         const int PollMs = 5000;
 
+        // Une icône par numéro de manette. Elles sont toutes créées au démarrage et jamais
+        // recréées : leurs identifiants restent les mêmes, donc Windows retient le choix
+        // « afficher dans la barre des tâches » fait pour chacune.
+        class TraySlot
+        {
+            public readonly NotifyIcon Icon = new NotifyIcon();
+            public IntPtr HIcon;
+            public string Key;
+        }
+
         readonly Control invoker = new Control();
-        readonly NotifyIcon tray = new NotifyIcon();
+        readonly TraySlot[] slots = new TraySlot[DualSense.MaxSlots];
         readonly ToolStripMenuItem startupItem;
         readonly AutoResetEvent wake = new AutoResetEvent(false);
         readonly HashSet<string> connected = new HashSet<string>();
         readonly HashSet<string> lowWarned = new HashSet<string>();
-        IntPtr currentHIcon = IntPtr.Zero;
-        string currentIconKey;
         volatile bool stopping;
 
         public TrayContext()
@@ -355,10 +389,14 @@ namespace DualSenseBattery
             var quit = new ToolStripMenuItem("Quitter", null, delegate { Quit(); });
             menu.Items.AddRange(new ToolStripItem[] { title, new ToolStripSeparator(), refresh, startupItem, new ToolStripSeparator(), quit });
 
-            tray.ContextMenuStrip = menu;
-            tray.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowDetails(); };
+            for (int i = 0; i < slots.Length; i++)
+            {
+                var slot = new TraySlot();
+                slot.Icon.ContextMenuStrip = menu;
+                slot.Icon.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) ShowDetails(slot.Icon); };
+                slots[i] = slot;
+            }
             Apply(new List<ControllerState>(), true);
-            tray.Visible = true;
 
             var worker = new Thread(Loop) { IsBackground = true, Name = "DualSense poll" };
             worker.Start();
@@ -385,43 +423,51 @@ namespace DualSenseBattery
             if (stopping) return;
             last = states;
 
-            // Notifications de connexion / batterie faible
+            // Une icône par manette numérotée ; la première affiche une manette grise
+            // quand aucune n'est connectée, pour garder l'accès au menu.
+            bool none = !states.Any(s => s.Slot > 0);
+            for (int i = 0; i < slots.Length; i++)
+            {
+                var st = states.FirstOrDefault(s => s.Slot == i + 1);
+                if (st != null || (i == 0 && none))
+                {
+                    SetIcon(slots[i], st);
+                    string tip = st != null ? st.Describe() : "Aucune manette PS5 connectée";
+                    slots[i].Icon.Text = tip.Length > 63 ? tip.Substring(0, 62) + "…" : tip;
+                    slots[i].Icon.Visible = true;
+                }
+                else slots[i].Icon.Visible = false;
+            }
+
+            // Notifications de connexion / batterie faible, sur l'icône de la manette concernée
             var paths = new HashSet<string>(states.Select(s => s.Path));
             foreach (var st in states)
             {
+                NotifyIcon icon = st.Slot > 0 ? slots[st.Slot - 1].Icon : slots[0].Icon;
                 if (!connected.Contains(st.Path) && !initial)
-                    tray.ShowBalloonTip(4000, "Manette PS5 connectée", st.Name + " (" + st.Link + ") : " + st.Status, ToolTipIcon.Info);
+                    icon.ShowBalloonTip(4000, st.Label + " connectée", st.Name + " (" + st.Link + ") : " + st.Status, ToolTipIcon.Info);
                 bool low = st.Percent >= 0 && st.Percent <= 20 && !st.Charging && !st.Full;
                 if (low && !lowWarned.Contains(st.Path))
                 {
                     lowWarned.Add(st.Path);
-                    tray.ShowBalloonTip(6000, "Batterie faible", st.Name + " : " + st.Percent + " %. Pense à la recharger.", ToolTipIcon.Warning);
+                    icon.ShowBalloonTip(6000, "Batterie faible", st.Label + " : " + st.Percent + " %. Pense à la recharger.", ToolTipIcon.Warning);
                 }
                 else if (!low) lowWarned.Remove(st.Path);
             }
             connected.Clear();
             connected.UnionWith(paths);
             lowWarned.IntersectWith(paths);
-
-            // L'icône montre la manette la plus déchargée
-            var shown = states.OrderBy(s => s.Percent < 0 ? int.MaxValue : s.Percent).FirstOrDefault();
-            SetIcon(shown);
-
-            string tip = states.Count == 0
-                ? "Aucune manette PS5 connectée"
-                : string.Join("\n", states.Select(s => s.Name + " (" + s.Link + ") : " + s.Status));
-            tray.Text = tip.Length > 63 ? tip.Substring(0, 62) + "…" : tip;
         }
 
-        void ShowDetails()
+        void ShowDetails(NotifyIcon from)
         {
             string text = last.Count == 0
                 ? "Aucune manette PS5 connectée."
                 : string.Join("\n", last.Select(s => s.Describe()));
-            tray.ShowBalloonTip(4000, "Batterie manette PS5", text, ToolTipIcon.None);
+            from.ShowBalloonTip(4000, "Batterie manette PS5", text, ToolTipIcon.None);
         }
 
-        void SetIcon(ControllerState st)
+        void SetIcon(TraySlot slot, ControllerState st)
         {
             string text; Color bg;
             if (st == null) { text = ""; bg = Color.FromArgb(125, 125, 125); }
@@ -436,15 +482,15 @@ namespace DualSenseBattery
             }
 
             string key = text + "|" + bg.ToArgb();
-            if (key == currentIconKey) return;
-            currentIconKey = key;
+            if (key == slot.Key) return;
+            slot.Key = key;
 
             IntPtr hIcon;
             Icon icon = Render(text, bg, out hIcon);
-            Icon old = tray.Icon;
-            IntPtr oldHandle = currentHIcon;
-            tray.Icon = icon;
-            currentHIcon = hIcon;
+            Icon old = slot.Icon.Icon;
+            IntPtr oldHandle = slot.HIcon;
+            slot.Icon.Icon = icon;
+            slot.HIcon = hIcon;
             if (old != null) old.Dispose();
             if (oldHandle != IntPtr.Zero) Native.DestroyIcon(oldHandle);
         }
@@ -479,9 +525,12 @@ namespace DualSenseBattery
         {
             stopping = true;
             wake.Set();
-            tray.Visible = false;
-            tray.Dispose();
-            if (currentHIcon != IntPtr.Zero) Native.DestroyIcon(currentHIcon);
+            foreach (var slot in slots)
+            {
+                slot.Icon.Visible = false;
+                slot.Icon.Dispose();
+                if (slot.HIcon != IntPtr.Zero) Native.DestroyIcon(slot.HIcon);
+            }
             ExitThread();
         }
     }
